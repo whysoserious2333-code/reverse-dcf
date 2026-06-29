@@ -147,6 +147,11 @@ def fetch_av(ticker, key):
     return cf, isn, bs, ov
 
 
+def fetch_quote(ticker, key):            # 不缓存——市值要新（铁律 #1）
+    gq = _av_get("GLOBAL_QUOTE", key, ticker).get("Global Quote", {})
+    return _av_num(gq.get("05. price")), gq.get("07. latest trading day")
+
+
 def compute_fcff_series_av(cf_annual, is_annual, add_back_interest=True):
     is_by_date = {x.get("fiscalDateEnding"): x for x in is_annual if x.get("fiscalDateEnding")}
     rows = []
@@ -169,15 +174,22 @@ def compute_fcff_series_av(cf_annual, is_annual, add_back_interest=True):
 
 def net_debt_av(bs_annual):
     b = bs_annual[0]
-    debt = _av_num(b.get("shortLongTermDebtTotal"))
+    debt = _av_num(b.get("shortLongTermDebtTotal"))   # AV 已给"有息负债合计"(短期+长期)，非总负债
     if debt == 0:
-        debt = _av_num(b.get("shortTermDebt")) + _av_num(b.get("longTermDebt"))
+        debt = (_av_num(b.get("shortTermDebt")) or _av_num(b.get("currentDebt"))) + \
+               (_av_num(b.get("longTermDebt")) or _av_num(b.get("longTermDebtNoncurrent")))
     cash = _av_num(b.get("cashAndShortTermInvestments")) or _av_num(b.get("cashAndCashEquivalentsAtCarryingValue"))
-    return debt - cash, b.get("fiscalDateEnding"), b.get("reportedCurrency")
+    return debt - cash, debt, cash, b.get("fiscalDateEnding"), b.get("reportedCurrency")
 
 
-def market_cap_av(ov):
-    return _av_num(ov.get("MarketCapitalization")), (ov.get("Currency") or "USD"), ov.get("Name")
+def market_cap_av(ov, quote):
+    cur = ov.get("Currency") or "USD"
+    name = ov.get("Name")
+    shares = _av_num(ov.get("SharesOutstanding"))
+    price, day = quote if quote else (0.0, None)
+    if price > 0 and shares > 0:
+        return price * shares, cur, name, f"截至 {day} 收盘（AV 价×股数）"
+    return _av_num(ov.get("MarketCapitalization")), cur, name, "AV OVERVIEW 快照（AV 不提供时点）"
 
 
 REGION_PRESETS = {"美国 (US)": (4.5, 5.5), "日本 (JP)": (1.6, 6.0),
@@ -236,9 +248,11 @@ if use_av:
         ticker = c1.text_input("美股 ticker", placeholder="例: NVDA / AMD / MU").strip().upper()
         if c2.button("拉取", use_container_width=True) and ticker:
             try:
-                with st.spinner("拉取中（AV 免费档限速，每秒 1 次，约 4–5 秒）…"):
+                with st.spinner("拉取中（AV 免费档限速，每秒 1 次，约 5–6 秒）…"):
                     cf, isn, bs, ov = fetch_av(ticker, api_key)
-                st.session_state["av_raw"] = dict(ticker=ticker, cf=cf, isn=isn, bs=bs, ov=ov)
+                    time.sleep(1.1)
+                    quote = fetch_quote(ticker, api_key)
+                st.session_state["av_raw"] = dict(ticker=ticker, cf=cf, isn=isn, bs=bs, ov=ov, quote=quote)
             except Exception as e:
                 st.session_state.pop("av_raw", None)
                 st.error(f"拉取失败：{e}")
@@ -249,12 +263,13 @@ if use_av:
         add_int = st.checkbox("利息加回（CFO→FCFF 口径）", value=True)
 
         rows = compute_fcff_series_av(raw["cf"], raw["isn"], add_int)
-        nd, nd_date, nd_cur = net_debt_av(raw["bs"])
-        mc, mc_cur, name = market_cap_av(raw["ov"])
+        nd, nd_debt, nd_cash, nd_date, nd_cur = net_debt_av(raw["bs"])
+        mc, mc_cur, name, mc_when = market_cap_av(raw["ov"], raw.get("quote"))
 
-        st.caption(f"市值 {mc:,.0f} {mc_cur}（AV 快照，**无精确时点，发布前务必核对**）"
-                   f" ｜ 财报 as-of {nd_date} {nd_cur}"
+        st.caption(f"市值 {mc:,.0f} {mc_cur} · {mc_when} — 发布前请用你的源核对（铁律 #1）"
                    + ("　⚠ 市值/财报币种不一致" if mc_cur != nd_cur else ""))
+        st.caption(f"净负债构成：有息负债 {nd_debt:,.0f} − 现金及短投 {nd_cash:,.0f} = "
+                   f"{nd:,.0f}（财报 as-of {nd_date} {nd_cur}）")
 
         df = pd.DataFrame(rows)[["year", "revenue", "cfo", "capex", "intx", "eff_tax", "fcff"]]
         df.columns = ["年", "收入", "CFO", "Capex", "利息", "有效税率", "FCFF"]
@@ -296,7 +311,7 @@ with col_l:
     st.subheader("市场报价")
     ccy = st.text_input("币种", key="in_ccy")
     st.number_input(f"市值 ({ccy})", key="in_mktcap", step=10.0, format="%.1f")
-    st.number_input(f"净负债 = 总负债 − 现金 ({ccy})", key="in_netdebt", step=10.0, format="%.1f")
+    st.number_input(f"净负债 = 有息负债 − 现金 ({ccy})", key="in_netdebt", step=10.0, format="%.1f")
     ev_target = st.session_state["in_mktcap"] + st.session_state["in_netdebt"]
     st.metric("→ 隐含 EV", f"{ev_target:,.1f}")
     src = st.text_input("市值来源 + 日期（铁律 #1）", placeholder="例: 2026-06-27 收盘 · TradingView")
@@ -330,6 +345,12 @@ with st.expander("WACC（默认美国口径，可改）", expanded=False):
         rf = c1.number_input("Rf (%)", value=float(rf_d or 4.5), step=0.1, format="%.2f")
         erp = c2.number_input("ERP (%)", value=float(erp_d or 5.5), step=0.1, format="%.2f")
         beta = c3.number_input("β（Damodaran 行业）", value=1.10, step=0.05, format="%.2f")
+        _av = st.session_state.get("av_raw")
+        if _av and _av.get("ov"):
+            _avb = _av_num(_av["ov"].get("Beta"))
+            if _avb:
+                st.caption(f"参考：AV 回归 β = {_avb:.2f}（个股市场 β，仅作 sensitivity；"
+                           f"你的口径请填 Damodaran 行业 β，别用回归 β）")
         c4, c5, c6 = st.columns(3)
         kd = c4.number_input("税前 Kd (%)", value=5.0, step=0.1, format="%.2f")
         tax = c5.number_input("税率 (%)", value=21.0, step=0.5, format="%.2f")
