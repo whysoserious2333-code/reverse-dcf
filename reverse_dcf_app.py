@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-反推 DCF · 预期翻译器 (Reverse DCF Expectations Calculator) — v0.3
+反推 DCF · 预期翻译器 (Reverse DCF Expectations Calculator) — v0.4
 ------------------------------------------------------------------------
-新增：美股 ticker 自动拉取（FMP 免费档）。非美 / 手动模式完整保留。
-自动拉取只做【预填】，所有字段仍可手动覆盖。市值单独处理（铁律 #1）。
+自动拉取改用 Alpha Vantage 免费档（仅美股）+ 自带 key（bring-your-own-key）。
+非美 / 手动模式完整保留。自动拉取只做【预填】，所有字段仍可手动覆盖。
 
-运行：
-    pip install -r requirements.txt
-    streamlit run reverse_dcf_app.py
-FMP key：在 Streamlit → Settings → Secrets 加一行  FMP_API_KEY = "你的key"
+⚠ AV 免费现金流表【不含 SBC 行】。需要 SBC 负担口径时，在面板里手动填 SBC，从基年扣除。
+⚠ AV 免费 25 次/天。每只票约 4 次调用 → 约 6 只/天。公开时让用户各自填 key，额度算自己的。
+
+运行：pip install -r requirements.txt ; streamlit run reverse_dcf_app.py
+AV 免费 key：alphavantage.co/support/#api-key（秒拿，不要信用卡）
 """
 
 import datetime
@@ -90,88 +91,82 @@ def capm_wacc(rf, erp, beta, kd, tax, wd):
 
 
 # ============================================================
-# 2. FMP 取数（仅美股 / 免费档）
+# 2. Alpha Vantage 取数（免费档 / 仅美股 / 自带 key）
 # ============================================================
-FMP_BASE = "https://financialmodelingprep.com/stable"   # stable 端点，用 ?symbol= 传 ticker
+AV_BASE = "https://www.alphavantage.co/query"
 
 
-def _fmp_get(path, key, **params):
-    params["apikey"] = key
-    r = requests.get(f"{FMP_BASE}/{path}", params=params, timeout=15)
+def _av_num(x):
+    if x is None:
+        return 0.0
+    s = str(x).strip()
+    if s in ("", "None", "-"):
+        return 0.0
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
+def _av_get(function, key, symbol):
+    r = requests.get(AV_BASE, params={"function": function, "symbol": symbol, "apikey": key}, timeout=20)
     r.raise_for_status()
     data = r.json()
-    if isinstance(data, dict) and data.get("Error Message"):
-        raise RuntimeError(data["Error Message"])
+    # AV 即使出错也回 200，错误信息在 JSON 里
+    for flag in ("Information", "Note", "Error Message"):
+        if isinstance(data, dict) and data.get(flag):
+            raise RuntimeError(str(data[flag])[:300])
     return data
 
 
-@st.cache_data(ttl=86400, show_spinner=False)   # 慢变量缓存 24h，省额度
-def fetch_fundamentals(ticker, key, years=5):
-    cf = _fmp_get("cash-flow-statement", key, symbol=ticker, limit=years)
-    isn = _fmp_get("income-statement", key, symbol=ticker, limit=years)
-    bs = _fmp_get("balance-sheet-statement", key, symbol=ticker, limit=1)
-    prof = _fmp_get("profile", key, symbol=ticker)
-    if not cf or not isn or not bs:
-        raise RuntimeError("无财报数据——可能是非美标的（免费档仅美股）或 ticker 拼写有误。")
-    return cf, isn, bs, prof
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_av(ticker, key):
+    isn = _av_get("INCOME_STATEMENT", key, ticker).get("annualReports", [])
+    bs = _av_get("BALANCE_SHEET", key, ticker).get("annualReports", [])
+    cf = _av_get("CASH_FLOW", key, ticker).get("annualReports", [])
+    ov = _av_get("OVERVIEW", key, ticker)
+    if not isn or not bs or not cf:
+        raise RuntimeError("无财报数据——可能是非美标的（免费档仅美股）、ticker 拼写有误，或当日额度已用尽。")
+    return cf, isn, bs, ov
 
 
-def fetch_marketcap(ticker, key):            # 市值【不缓存】——铁律 #1
-    return _fmp_get("quote", key, symbol=ticker)
-
-
-def _row_year(r):
-    return str(r.get("calendarYear") or r.get("fiscalYear") or (r.get("date", "") or "")[:4] or "")
-
-
-def compute_fcff_series(cf_list, is_list, add_back_interest=True, charge_sbc=True):
-    is_by_date = {x.get("date"): x for x in is_list if x.get("date")}
-    is_by_year = {_row_year(x): x for x in is_list}
+def compute_fcff_series_av(cf_annual, is_annual, add_back_interest=True):
+    is_by_date = {x.get("fiscalDateEnding"): x for x in is_annual if x.get("fiscalDateEnding")}
     rows = []
-    for c in cf_list:
-        inc = is_by_date.get(c.get("date")) or is_by_year.get(_row_year(c), {})
-        cfo = float(c.get("operatingCashFlow") or 0)
-        capex = abs(float(c.get("capitalExpenditure") or 0))
-        sbc = float(c.get("stockBasedCompensation") or 0)
-        rev = float(inc.get("revenue") or 0)
-        ibt = float(inc.get("incomeBeforeTax") or 0)
-        texp = float(inc.get("incomeTaxExpense") or 0)
-        intx = abs(float(inc.get("interestExpense") or 0))
+    for c in cf_annual[:5]:
+        inc = is_by_date.get(c.get("fiscalDateEnding"), {})
+        cfo = _av_num(c.get("operatingCashflow"))
+        capex = abs(_av_num(c.get("capitalExpenditures")))
+        rev = _av_num(inc.get("totalRevenue"))
+        ibt = _av_num(inc.get("incomeBeforeTax"))
+        texp = _av_num(inc.get("incomeTaxExpense"))
+        intx = abs(_av_num(inc.get("interestExpense")))
         eff_tax = (texp / ibt) if ibt > 0 else 0.21
         fcff = cfo - capex
-        if charge_sbc:
-            fcff -= sbc
         if add_back_interest:
             fcff += intx * (1 - eff_tax)
-        rows.append(dict(year=_row_year(c), revenue=rev, cfo=cfo, capex=capex, sbc=sbc,
-                         eff_tax=eff_tax, fcff=fcff))
+        rows.append(dict(year=(c.get("fiscalDateEnding", "") or "")[:4], revenue=rev,
+                         cfo=cfo, capex=capex, intx=intx, eff_tax=eff_tax, fcff=fcff))
     return rows
 
 
-def net_debt_from_bs(bs_list):
-    b = bs_list[0]
-    td = float(b.get("totalDebt") or 0)
-    cash = float(b.get("cashAndShortTermInvestments") or b.get("cashAndCashEquivalents") or 0)
-    return td - cash, b.get("date"), b.get("reportedCurrency")
+def net_debt_av(bs_annual):
+    b = bs_annual[0]
+    debt = _av_num(b.get("shortLongTermDebtTotal"))
+    if debt == 0:
+        debt = _av_num(b.get("shortTermDebt")) + _av_num(b.get("longTermDebt"))
+    cash = _av_num(b.get("cashAndShortTermInvestments")) or _av_num(b.get("cashAndCashEquivalentsAtCarryingValue"))
+    return debt - cash, b.get("fiscalDateEnding"), b.get("reportedCurrency")
 
 
-def market_cap_from_quote(quote_list, prof_list):
-    q = quote_list[0] if quote_list else {}
-    prof = prof_list[0] if prof_list else {}
-    mc = float(q.get("marketCap") or prof.get("marketCap") or prof.get("mktCap") or 0)
-    ts = q.get("timestamp")
-    when = (datetime.datetime.fromtimestamp(int(ts), datetime.timezone.utc)
-            .strftime("%Y-%m-%d %H:%M UTC")) if ts else "n/a"
-    cur = prof.get("currency") or "USD"
-    name = prof.get("companyName")
-    return mc, when, cur, name
+def market_cap_av(ov):
+    return _av_num(ov.get("MarketCapitalization")), (ov.get("Currency") or "USD"), ov.get("Name")
 
 
 REGION_PRESETS = {"美国 (US)": (4.5, 5.5), "日本 (JP)": (1.6, 6.0),
                   "韩国 (KR)": (3.5, 6.0), "自定义": (None, None)}
 MODE_FCFF = "从 FCFF 出发（已盈利 / 正现金流）"
 MODE_REV = "从收入出发（当前 FCFF 为负 / 盈利前）"
-
 DEFAULTS = {"in_ccy": "USD", "in_mktcap": 1000.0, "in_netdebt": 0.0,
             "in_fcff0": 60.0, "in_rev0": 10.0, "in_curfcff": -3.0}
 
@@ -195,84 +190,84 @@ with st.expander("⚠ 先读：方法适用边界", expanded=False):
         "1. **FCFF 为负的成长股** —— 不要用 FCFF 模式，切到收入模式；稳态利润率是你假设的、最任性的输入。\n\n"
         "2. **强周期股** —— 别用峰值 FCFF 当基年。自动拉取会给你 5 年序列，请考虑用周期均值。\n\n"
         "3. **exit multiple 当终值** —— 会掩盖 capex 跑步机，资产重的公司尤其失真。\n\n"
-        "4. **自动拉取仅美股**（FMP 免费档）。非美标的请手动填，并核对市值与财报币种是否一致。"
+        "4. **自动拉取仅美股**（Alpha Vantage 免费档），且现金流表**不含 SBC**——需要时手动填。"
+        "非美标的请手动填，并核对市值与财报币种。"
     )
 
 st.divider()
 mode = st.radio("反推方法", [MODE_FCFF, MODE_REV], index=0)
 
-# ---------- 数据来源（FMP 预填层） ----------
+# ---------- 数据来源（Alpha Vantage 预填层） ----------
 st.subheader("数据来源")
-use_fmp = st.toggle("从 FMP 自动拉取（仅美股，免费档）", value=False)
+use_av = st.toggle("从 Alpha Vantage 自动拉取（免费 · 仅美股）", value=False)
 
-if use_fmp:
+if use_av:
+    user_key = st.text_input("你的 Alpha Vantage key（仅本次会话使用，不保存）", type="password",
+                             help="免费 key：alphavantage.co/support/#api-key，秒拿，25 次/天。")
     try:
-        api_key = st.secrets.get("FMP_API_KEY", "")
+        secret_key = st.secrets.get("ALPHAVANTAGE_API_KEY", "")
     except Exception:
-        api_key = ""
+        secret_key = ""
+    api_key = (user_key or "").strip() or secret_key
+
     if requests is None:
-        st.error("缺少 requests 库。requirements.txt 已含，重新部署即可。")
+        st.error("缺少 requests 库；重新部署即可。")
     elif not api_key:
-        st.warning("未配置 FMP_API_KEY：Streamlit → Settings → Secrets 加一行 "
-                   "`FMP_API_KEY = \"你的key\"`。在此之前仅手动模式可用。")
+        st.info("填入一个免费 Alpha Vantage key 即可自动拉取。没有 key 时用手动模式。")
     else:
         c1, c2 = st.columns([3, 1])
         ticker = c1.text_input("美股 ticker", placeholder="例: NVDA / AMD / MU").strip().upper()
         if c2.button("拉取", use_container_width=True) and ticker:
             try:
-                cf, isn, bs, prof = fetch_fundamentals(ticker, api_key)
-                quote = fetch_marketcap(ticker, api_key)
-                st.session_state["fmp_raw"] = dict(ticker=ticker, cf=cf, isn=isn,
-                                                   bs=bs, prof=prof, quote=quote)
+                cf, isn, bs, ov = fetch_av(ticker, api_key)
+                st.session_state["av_raw"] = dict(ticker=ticker, cf=cf, isn=isn, bs=bs, ov=ov)
             except Exception as e:
-                st.session_state.pop("fmp_raw", None)
+                st.session_state.pop("av_raw", None)
                 st.error(f"拉取失败：{e}")
 
-    if "fmp_raw" in st.session_state:
-        raw = st.session_state["fmp_raw"]
-        st.markdown(f"**{raw['ticker']}** 已拉取。下面的拆解可调，确认后点「填入」推入输入框。")
-        a, b = st.columns(2)
-        add_int = a.checkbox("利息加回（CFO→FCFF 口径）", value=True)
-        chg_sbc = b.checkbox("SBC 当真实成本扣除", value=True)
+    if "av_raw" in st.session_state:
+        raw = st.session_state["av_raw"]
+        st.markdown(f"**{raw['ticker']}** 已拉取。下面口径可调，确认后点「填入」推入输入框。")
+        add_int = st.checkbox("利息加回（CFO→FCFF 口径）", value=True)
 
-        rows = compute_fcff_series(raw["cf"], raw["isn"], add_int, chg_sbc)
-        nd, nd_date, nd_cur = net_debt_from_bs(raw["bs"])
-        mc, mc_when, mc_cur, name = market_cap_from_quote(raw["quote"], raw["prof"])
+        rows = compute_fcff_series_av(raw["cf"], raw["isn"], add_int)
+        nd, nd_date, nd_cur = net_debt_av(raw["bs"])
+        mc, mc_cur, name = market_cap_av(raw["ov"])
 
-        # 数据来源与时点
-        st.caption(f"市值 {mc:,.0f} {mc_cur} · 时点 {mc_when}（FMP 快照，发布前请用你的源核对）"
+        st.caption(f"市值 {mc:,.0f} {mc_cur}（AV 快照，**无精确时点，发布前务必核对**）"
                    f" ｜ 财报 as-of {nd_date} {nd_cur}"
                    + ("　⚠ 市值/财报币种不一致" if mc_cur != nd_cur else ""))
 
-        # FCFF 序列表
-        df = pd.DataFrame(rows)[["year", "revenue", "cfo", "capex", "sbc", "eff_tax", "fcff"]]
-        df.columns = ["年", "收入", "CFO", "Capex", "SBC", "有效税率", "FCFF"]
+        df = pd.DataFrame(rows)[["year", "revenue", "cfo", "capex", "intx", "eff_tax", "fcff"]]
+        df.columns = ["年", "收入", "CFO", "Capex", "利息", "有效税率", "FCFF"]
         st.dataframe(df.style.format({"收入": "{:,.0f}", "CFO": "{:,.0f}", "Capex": "{:,.0f}",
-                                      "SBC": "{:,.0f}", "有效税率": "{:.1%}", "FCFF": "{:,.0f}"}),
+                                      "利息": "{:,.0f}", "有效税率": "{:.1%}", "FCFF": "{:,.0f}"}),
                      hide_index=True, use_container_width=True)
+        st.caption("注：AV 现金流表不含 SBC。如需按 SBC 负担口径，在下方手动填 SBC 金额从基年 FCFF 扣除。")
 
-        latest = rows[0]["fcff"]
-        avg5 = sum(r["fcff"] for r in rows) / len(rows)
-        if avg5 != 0 and abs(latest / avg5 - 1) > 0.25:
-            st.warning(f"最新年 FCFF 偏离 5 年均值 {(latest/avg5-1)*100:+.0f}%——疑似周期位置，"
-                       f"考虑选「5 年均值」当基年。")
+        # 周期告警：正负年并存直接警告；否则看偏离均值
+        fcffs = [r["fcff"] for r in rows]
+        avg5 = sum(fcffs) / len(fcffs)
+        if any(f > 0 for f in fcffs) and any(f < 0 for f in fcffs):
+            st.warning("FCFF 在正负之间波动（疑似周期 / 转折期）——基年口径影响极大，慎选。")
+        elif abs(avg5) > 1e-9 and abs(fcffs[0] / avg5 - 1) > 0.25:
+            st.warning(f"最新年 FCFF 偏离均值 {(fcffs[0]/avg5-1)*100:+.0f}%——疑似周期位置，考虑用均值。")
 
-        # 基年选择
         opts = [f"{r['year']}（最新）" if i == 0 else r["year"] for i, r in enumerate(rows)]
-        opts.append("5 年均值（周期）")
+        opts.append("近 5 年均值（周期）")
         pick = st.selectbox("基年 FCFF 口径", opts, index=0)
-        chosen_fcff = avg5 if pick.startswith("5 年") else rows[opts.index(pick)]["fcff"]
-        latest_rev = rows[0]["revenue"]
+        base_fcff = avg5 if pick.startswith("近") else rows[opts.index(pick)]["fcff"]
+        sbc_manual = st.number_input("手动 SBC（从基年 FCFF 扣除，可选）", value=0.0, step=1.0, format="%.1f")
 
         if st.button("↧ 填入下方输入框", type="primary"):
             st.session_state["in_mktcap"] = float(mc)
             st.session_state["in_netdebt"] = float(nd)
             st.session_state["in_ccy"] = mc_cur
             if mode == MODE_FCFF:
-                st.session_state["in_fcff0"] = float(chosen_fcff)
+                st.session_state["in_fcff0"] = float(base_fcff - sbc_manual)
             else:
-                st.session_state["in_rev0"] = float(latest_rev)
-                st.session_state["in_curfcff"] = float(latest)   # 当前(最新年)FCFF
+                st.session_state["in_rev0"] = float(rows[0]["revenue"])
+                st.session_state["in_curfcff"] = float(rows[0]["fcff"] - sbc_manual)
             st.success("已填入。下面仍可手动调整。")
 
 st.divider()
@@ -435,5 +430,5 @@ else:
                 st.caption("提示：市值来源/日期未填（铁律 #1）。")
 
 st.divider()
-st.caption("方法论演示，输出为市场预期的反推翻译，非投资建议。自动拉取数据为 FMP 快照，"
+st.caption("方法论演示，输出为市场预期的反推翻译，非投资建议。自动拉取数据为 Alpha Vantage 快照，"
            "发布前请按最新财报与个人判断核对。")
