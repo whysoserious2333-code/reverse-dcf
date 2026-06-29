@@ -92,7 +92,7 @@ def capm_wacc(rf, erp, beta, kd, tax, wd):
 # ============================================================
 # 2. FMP 取数（仅美股 / 免费档）
 # ============================================================
-FMP_BASE = "https://financialmodelingprep.com/api/v3"   # 若 FMP 弃用 v3，改这一行为 stable 路径
+FMP_BASE = "https://financialmodelingprep.com/stable"   # stable 端点，用 ?symbol= 传 ticker
 
 
 def _fmp_get(path, key, **params):
@@ -107,28 +107,32 @@ def _fmp_get(path, key, **params):
 
 @st.cache_data(ttl=86400, show_spinner=False)   # 慢变量缓存 24h，省额度
 def fetch_fundamentals(ticker, key, years=5):
-    cf = _fmp_get(f"cash-flow-statement/{ticker}", key, limit=years)
-    isn = _fmp_get(f"income-statement/{ticker}", key, limit=years)
-    bs = _fmp_get(f"balance-sheet-statement/{ticker}", key, limit=1)
-    prof = _fmp_get(f"profile/{ticker}", key)
+    cf = _fmp_get("cash-flow-statement", key, symbol=ticker, limit=years)
+    isn = _fmp_get("income-statement", key, symbol=ticker, limit=years)
+    bs = _fmp_get("balance-sheet-statement", key, symbol=ticker, limit=1)
+    prof = _fmp_get("profile", key, symbol=ticker)
     if not cf or not isn or not bs:
         raise RuntimeError("无财报数据——可能是非美标的（免费档仅美股）或 ticker 拼写有误。")
     return cf, isn, bs, prof
 
 
 def fetch_marketcap(ticker, key):            # 市值【不缓存】——铁律 #1
-    return _fmp_get(f"quote/{ticker}", key)
+    return _fmp_get("quote", key, symbol=ticker)
+
+
+def _row_year(r):
+    return str(r.get("calendarYear") or r.get("fiscalYear") or (r.get("date", "") or "")[:4] or "")
 
 
 def compute_fcff_series(cf_list, is_list, add_back_interest=True, charge_sbc=True):
-    is_by_year = {str(x.get("calendarYear")): x for x in is_list}
+    is_by_date = {x.get("date"): x for x in is_list if x.get("date")}
+    is_by_year = {_row_year(x): x for x in is_list}
     rows = []
     for c in cf_list:
-        y = str(c.get("calendarYear"))
+        inc = is_by_date.get(c.get("date")) or is_by_year.get(_row_year(c), {})
         cfo = float(c.get("operatingCashFlow") or 0)
         capex = abs(float(c.get("capitalExpenditure") or 0))
         sbc = float(c.get("stockBasedCompensation") or 0)
-        inc = is_by_year.get(y, {})
         rev = float(inc.get("revenue") or 0)
         ibt = float(inc.get("incomeBeforeTax") or 0)
         texp = float(inc.get("incomeTaxExpense") or 0)
@@ -139,7 +143,7 @@ def compute_fcff_series(cf_list, is_list, add_back_interest=True, charge_sbc=Tru
             fcff -= sbc
         if add_back_interest:
             fcff += intx * (1 - eff_tax)
-        rows.append(dict(year=y, revenue=rev, cfo=cfo, capex=capex, sbc=sbc,
+        rows.append(dict(year=_row_year(c), revenue=rev, cfo=cfo, capex=capex, sbc=sbc,
                          eff_tax=eff_tax, fcff=fcff))
     return rows
 
@@ -152,13 +156,14 @@ def net_debt_from_bs(bs_list):
 
 
 def market_cap_from_quote(quote_list, prof_list):
-    q = quote_list[0]
-    mc = float(q.get("marketCap") or 0)
+    q = quote_list[0] if quote_list else {}
+    prof = prof_list[0] if prof_list else {}
+    mc = float(q.get("marketCap") or prof.get("marketCap") or prof.get("mktCap") or 0)
     ts = q.get("timestamp")
     when = (datetime.datetime.fromtimestamp(int(ts), datetime.timezone.utc)
             .strftime("%Y-%m-%d %H:%M UTC")) if ts else "n/a"
-    cur = (prof_list[0].get("currency") if prof_list else None) or "USD"
-    name = prof_list[0].get("companyName") if prof_list else None
+    cur = prof.get("currency") or "USD"
+    name = prof.get("companyName")
     return mc, when, cur, name
 
 
