@@ -1,3 +1,4 @@
 streamlit>=1.40
 scipy>=1.11
 pandas>=2.0
+requests>=2.31
