@@ -135,16 +135,19 @@ def _av_get(function, key, symbol, _tries=2):
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_av(ticker, key):
-    isn = _av_get("INCOME_STATEMENT", key, ticker).get("annualReports", [])
+    inc = _av_get("INCOME_STATEMENT", key, ticker)
     time.sleep(1.1)
-    bs = _av_get("BALANCE_SHEET", key, ticker).get("annualReports", [])
+    bal = _av_get("BALANCE_SHEET", key, ticker)
     time.sleep(1.1)
-    cf = _av_get("CASH_FLOW", key, ticker).get("annualReports", [])
+    cfs = _av_get("CASH_FLOW", key, ticker)
     time.sleep(1.1)
     ov = _av_get("OVERVIEW", key, ticker)
-    if not isn or not bs or not cf:
+    is_a, is_q = inc.get("annualReports", []), inc.get("quarterlyReports", [])
+    bs_a = bal.get("annualReports", [])
+    cf_a, cf_q = cfs.get("annualReports", []), cfs.get("quarterlyReports", [])
+    if not is_a or not bs_a or not cf_a:
         raise RuntimeError("无财报数据——可能是非美标的（免费档仅美股）、ticker 拼写有误，或当日额度已用尽。")
-    return cf, isn, bs, ov
+    return cf_a, cf_q, is_a, is_q, bs_a, ov
 
 
 def fetch_quote(ticker, key):            # 不缓存——市值要新（铁律 #1）
@@ -170,6 +173,25 @@ def compute_fcff_series_av(cf_annual, is_annual, add_back_interest=True):
         rows.append(dict(year=(c.get("fiscalDateEnding", "") or "")[:4], revenue=rev,
                          cfo=cfo, capex=capex, intx=intx, eff_tax=eff_tax, fcff=fcff))
     return rows
+
+
+def compute_ttm_av(cf_q, is_q, add_back_interest=True):
+    """TTM = 最近 4 个季度求和。季度不足 4 个返回 None。"""
+    if len(cf_q) < 4 or len(is_q) < 4:
+        return None
+    cfq, isq = cf_q[:4], is_q[:4]
+    cfo = sum(_av_num(x.get("operatingCashflow")) for x in cfq)
+    capex = sum(abs(_av_num(x.get("capitalExpenditures"))) for x in cfq)
+    rev = sum(_av_num(x.get("totalRevenue")) for x in isq)
+    ibt = sum(_av_num(x.get("incomeBeforeTax")) for x in isq)
+    texp = sum(_av_num(x.get("incomeTaxExpense")) for x in isq)
+    intx = sum(abs(_av_num(x.get("interestExpense"))) for x in isq)
+    eff_tax = (texp / ibt) if ibt > 0 else 0.21
+    fcff = cfo - capex
+    if add_back_interest:
+        fcff += intx * (1 - eff_tax)
+    return dict(year=f"TTM(截至{cfq[0].get('fiscalDateEnding')})", revenue=rev,
+                cfo=cfo, capex=capex, intx=intx, eff_tax=eff_tax, fcff=fcff)
 
 
 def net_debt_av(bs_annual):
@@ -249,10 +271,11 @@ if use_av:
         if c2.button("拉取", use_container_width=True) and ticker:
             try:
                 with st.spinner("拉取中（AV 免费档限速，每秒 1 次，约 5–6 秒）…"):
-                    cf, isn, bs, ov = fetch_av(ticker, api_key)
+                    cf_a, cf_q, is_a, is_q, bs_a, ov = fetch_av(ticker, api_key)
                     time.sleep(1.1)
                     quote = fetch_quote(ticker, api_key)
-                st.session_state["av_raw"] = dict(ticker=ticker, cf=cf, isn=isn, bs=bs, ov=ov, quote=quote)
+                st.session_state["av_raw"] = dict(ticker=ticker, cf_a=cf_a, cf_q=cf_q,
+                                                  is_a=is_a, is_q=is_q, bs_a=bs_a, ov=ov, quote=quote)
             except Exception as e:
                 st.session_state.pop("av_raw", None)
                 st.error(f"拉取失败：{e}")
@@ -262,8 +285,9 @@ if use_av:
         st.markdown(f"**{raw['ticker']}** 已拉取。下面口径可调，确认后点「填入」推入输入框。")
         add_int = st.checkbox("利息加回（CFO→FCFF 口径）", value=True)
 
-        rows = compute_fcff_series_av(raw["cf"], raw["isn"], add_int)
-        nd, nd_debt, nd_cash, nd_date, nd_cur = net_debt_av(raw["bs"])
+        rows = compute_fcff_series_av(raw["cf_a"], raw["is_a"], add_int)
+        ttm = compute_ttm_av(raw["cf_q"], raw["is_q"], add_int)
+        nd, nd_debt, nd_cash, nd_date, nd_cur = net_debt_av(raw["bs_a"])
         mc, mc_cur, name, mc_when = market_cap_av(raw["ov"], raw.get("quote"))
 
         st.caption(f"市值 {mc:,.0f} {mc_cur} · {mc_when} — 发布前请用你的源核对（铁律 #1）"
@@ -271,12 +295,14 @@ if use_av:
         st.caption(f"净负债构成：有息负债 {nd_debt:,.0f} − 现金及短投 {nd_cash:,.0f} = "
                    f"{nd:,.0f}（财报 as-of {nd_date} {nd_cur}）")
 
-        df = pd.DataFrame(rows)[["year", "revenue", "cfo", "capex", "intx", "eff_tax", "fcff"]]
+        disp = ([ttm] + rows) if ttm else rows
+        df = pd.DataFrame(disp)[["year", "revenue", "cfo", "capex", "intx", "eff_tax", "fcff"]]
         df.columns = ["年", "收入", "CFO", "Capex", "利息", "有效税率", "FCFF"]
         st.dataframe(df.style.format({"收入": "{:,.0f}", "CFO": "{:,.0f}", "Capex": "{:,.0f}",
                                       "利息": "{:,.0f}", "有效税率": "{:.1%}", "FCFF": "{:,.0f}"}),
                      hide_index=True, use_container_width=True)
-        st.caption("注：AV 现金流表不含 SBC。如需按 SBC 负担口径，在下方手动填 SBC 金额从基年 FCFF 扣除。")
+        st.caption("注：AV 现金流表不含 SBC。如需 SBC 负担口径，在下方手动填 SBC 从基年扣除。"
+                   "默认基年用 TTM（最近 4 季滚动）——年报可能严重滞后（如美光财年 8 月底结束）。")
 
         # 周期告警：正负年并存直接警告；否则看偏离均值
         fcffs = [r["fcff"] for r in rows]
@@ -284,14 +310,20 @@ if use_av:
         if any(f > 0 for f in fcffs) and any(f < 0 for f in fcffs):
             st.warning("FCFF 在正负之间波动（疑似周期 / 转折期）——基年口径影响极大，慎选。")
         elif abs(avg5) > 1e-9 and abs(fcffs[0] / avg5 - 1) > 0.25:
-            st.warning(f"最新年 FCFF 偏离均值 {(fcffs[0]/avg5-1)*100:+.0f}%——疑似周期位置，考虑用均值。")
+            st.warning(f"最新年 FCFF 偏离均值 {(fcffs[0]/avg5-1)*100:+.0f}%——疑似周期位置，可对比 TTM / 均值。")
 
-        opts = [f"{r['year']}（最新）" if i == 0 else r["year"] for i, r in enumerate(rows)]
-        opts.append("近 5 年均值（周期）")
-        pick = st.selectbox("基年 FCFF 口径", opts, index=0)
-        base_fcff = avg5 if pick.startswith("近") else rows[opts.index(pick)]["fcff"]
+        choices = {}
+        if ttm:
+            choices[ttm["year"] + " · 推荐"] = ttm["fcff"]
+        for i, r in enumerate(rows):
+            choices[f"{r['year']}（最新年报）" if i == 0 else r["year"]] = r["fcff"]
+        choices["近 5 年均值（周期）"] = avg5
+        pick = st.selectbox("基年 FCFF 口径", list(choices.keys()), index=0)
+        base_fcff = choices[pick]
         sbc_manual = st.number_input("手动 SBC（从基年 FCFF 扣除，可选）", value=0.0, step=1.0, format="%.1f")
 
+        base_rev = ttm["revenue"] if ttm else rows[0]["revenue"]
+        base_cur_fcff = ttm["fcff"] if ttm else rows[0]["fcff"]
         if st.button("↧ 填入下方输入框", type="primary"):
             st.session_state["in_mktcap"] = float(mc)
             st.session_state["in_netdebt"] = float(nd)
@@ -299,8 +331,8 @@ if use_av:
             if mode == MODE_FCFF:
                 st.session_state["in_fcff0"] = float(base_fcff - sbc_manual)
             else:
-                st.session_state["in_rev0"] = float(rows[0]["revenue"])
-                st.session_state["in_curfcff"] = float(rows[0]["fcff"] - sbc_manual)
+                st.session_state["in_rev0"] = float(base_rev)
+                st.session_state["in_curfcff"] = float(base_cur_fcff - sbc_manual)
             st.success("已填入。下面仍可手动调整。")
 
 st.divider()
