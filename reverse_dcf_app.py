@@ -13,6 +13,7 @@ AV 免费 key：alphavantage.co/support/#api-key（秒拿，不要信用卡）
 """
 
 import datetime
+import time
 import pandas as pd
 import streamlit as st
 from scipy.optimize import brentq
@@ -108,22 +109,38 @@ def _av_num(x):
         return 0.0
 
 
-def _av_get(function, key, symbol):
-    r = requests.get(AV_BASE, params={"function": function, "symbol": symbol, "apikey": key}, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    # AV 即使出错也回 200，错误信息在 JSON 里
-    for flag in ("Information", "Note", "Error Message"):
-        if isinstance(data, dict) and data.get(flag):
-            raise RuntimeError(str(data[flag])[:300])
+def _av_get(function, key, symbol, _tries=2):
+    for attempt in range(_tries):
+        r = requests.get(AV_BASE, params={"function": function, "symbol": symbol, "apikey": key}, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        msg = None
+        for flag in ("Error Message", "Information", "Note"):  # AV 出错也回 200，信息在 JSON 里
+            if isinstance(data, dict) and data.get(flag):
+                msg = str(data[flag]); break
+        if not msg:
+            return data
+        low = msg.lower()
+        rate = ("per second" in low or "spreading out" in low or
+                "thank you for using" in low or "frequency" in low or "per day" in low)
+        if rate and attempt < _tries - 1:
+            time.sleep(2.0)
+            continue
+        if rate:
+            raise RuntimeError("AV 限速：每秒最多 1 次、每天 25 次。已自动放慢重试仍失败——"
+                               "稍等几秒重试，或当日 25 次已用尽（明日再试 / 换 key）。")
+        raise RuntimeError(msg[:200])
     return data
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_av(ticker, key):
     isn = _av_get("INCOME_STATEMENT", key, ticker).get("annualReports", [])
+    time.sleep(1.1)
     bs = _av_get("BALANCE_SHEET", key, ticker).get("annualReports", [])
+    time.sleep(1.1)
     cf = _av_get("CASH_FLOW", key, ticker).get("annualReports", [])
+    time.sleep(1.1)
     ov = _av_get("OVERVIEW", key, ticker)
     if not isn or not bs or not cf:
         raise RuntimeError("无财报数据——可能是非美标的（免费档仅美股）、ticker 拼写有误，或当日额度已用尽。")
@@ -219,7 +236,8 @@ if use_av:
         ticker = c1.text_input("美股 ticker", placeholder="例: NVDA / AMD / MU").strip().upper()
         if c2.button("拉取", use_container_width=True) and ticker:
             try:
-                cf, isn, bs, ov = fetch_av(ticker, api_key)
+                with st.spinner("拉取中（AV 免费档限速，每秒 1 次，约 4–5 秒）…"):
+                    cf, isn, bs, ov = fetch_av(ticker, api_key)
                 st.session_state["av_raw"] = dict(ticker=ticker, cf=cf, isn=isn, bs=bs, ov=ov)
             except Exception as e:
                 st.session_state.pop("av_raw", None)
