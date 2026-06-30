@@ -481,6 +481,11 @@ if mode == MODE_FCFF:
             st.metric(f"隐含 {n} 年 FCFF CAGR", f"{cagr*100:.1f}%")
             st.markdown(f"> 市场报价隐含：未来 **{n} 年 FCFF 年均增长 {cagr*100:.1f}%**，"
                         f"即 {n} 年后达到今天的 **{(1+cagr)**n:.1f} 倍**。")
+            proj_labels = [f"Y{t}" for t in range(1, n + 1)] + ["N+1·终值首期"]
+            proj_fcff = [fcff0 * (1 + cagr) ** t for t in range(1, n + 1)]
+            proj_fcff.append(fcff0 * (1 + cagr) ** n * (1 + g_term))
+            st.caption("市场隐含的预测期 FCFF 轨迹（最后一根为终值首期 N+1，单位同输入）")
+            st.bar_chart(pd.DataFrame({"FCFF": proj_fcff}, index=proj_labels))
             d1, d2, d3 = st.columns(3)
             d1.metric("终值现值占比", f"{ts*100:.0f}%")
             d2.metric(f"FCFF_{n}", f"{fcff_n:,.1f}")
@@ -520,7 +525,7 @@ else:
         if cagr is None:
             st.error("目标 EV 超出可解范围。请检查 mT / K / 终值方法。")
         else:
-            _, pve, pvt, fcff_n, rev_n, _ = dcf_ev_rev(rev0, cagr, wacc, n, m0, mT, k, **kw)
+            _, pve, pvt, fcff_n, rev_n, fcffs = dcf_ev_rev(rev0, cagr, wacc, n, m0, mT, k, **kw)
             ts = pvt / (pve + pvt) if (pve + pvt) != 0 else float("inf")
             cy = crossover_year(m0, mT, k)
             st.metric(f"隐含 {n} 年【收入】CAGR", f"{cagr*100:.1f}%")
@@ -533,6 +538,16 @@ else:
             st.markdown(f"> 未来 **{n} 年收入年均增长 {cagr*100:.1f}%**（{n} 年后收入 = 今天的 "
                         f"**{(1+cagr)**n:.1f} 倍**）。利润率在 {k} 年内从 {m0*100:.1f}% 收敛到 {mT*100:.0f}%。")
             st.info(f"按此路径，FCFF 预计第 **{cy:.1f}** 年转正（之前各年为负，已计入折现）。")
+            proj_labels = [f"Y{t}" for t in range(1, n + 1)] + ["N+1·终值首期"]
+            proj_rev = [rev0 * (1 + cagr) ** t for t in range(1, n + 1)] + [rev_n * (1 + g_term)]
+            proj_fcff = list(fcffs) + [fcff_n * (1 + g_term)]
+            pc1, pc2 = st.columns(2)
+            with pc1:
+                st.caption("隐含预测期收入（含终值首期 N+1）")
+                st.bar_chart(pd.DataFrame({"收入": proj_rev}, index=proj_labels))
+            with pc2:
+                st.caption("隐含预测期 FCFF（含终值首期 N+1）")
+                st.bar_chart(pd.DataFrame({"FCFF": proj_fcff}, index=proj_labels))
             d1, d2, d3 = st.columns(3)
             d1.metric("终值现值占比", f"{ts*100:.0f}%" if ts != float("inf") else "n/a")
             d2.metric(f"FCFF_{n}", f"{fcff_n:,.1f}")
@@ -550,8 +565,16 @@ else:
                 srows.append({"单项变动（其他不变）": lbl,
                               "隐含收入 CAGR": f"{c2*100:.1f}%" if c2 is not None else "—",
                               "Δ(pp)": f"{(c2-cagr)*100:+.1f}" if c2 is not None else "—"})
-            st.caption("敏感性（单项变动 ±1%；稳态利润率 mT 的敏感性见上方提示）")
+            st.caption("敏感性（单项变动 ±1%；稳态利润率 mT 的敏感性见下表）")
             st.dataframe(pd.DataFrame(srows), hide_index=True, use_container_width=True)
+            mt_rows = []
+            for mt in [0.05, 0.10, 0.15, 0.20, 0.25, 0.30]:
+                c2 = solve_cagr_rev(ev_target, rev0, wacc, n, m0, mt, k, **kw)
+                mt_rows.append({"稳态利润率 mT": f"{mt*100:.0f}%",
+                                "隐含收入 CAGR": f"{c2*100:.1f}%" if c2 is not None else "—",
+                                "Δ(pp) vs 当前": f"{(c2-cagr)*100:+.1f}" if c2 is not None else "—"})
+            st.caption(f"稳态利润率 mT 完整敏感性（最关键假设；当前 mT = {mT*100:.0f}%）")
+            st.dataframe(pd.DataFrame(mt_rows), hide_index=True, use_container_width=True)
             if src.strip() == "":
                 st.caption("提示：市值来源/日期未填（铁律 #1）。")
 
