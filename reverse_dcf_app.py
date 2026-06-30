@@ -13,6 +13,7 @@ AV 免费 key：alphavantage.co/support/#api-key（秒拿，不要信用卡）
 """
 
 import datetime
+import json
 import time
 import pandas as pd
 import streamlit as st
@@ -253,6 +254,15 @@ st.subheader("数据来源")
 use_av = st.toggle("从 Alpha Vantage 自动拉取（免费 · 仅美股）", value=False)
 
 if use_av:
+    with st.expander("⬆ 导入已保存的数据（无需 key，不耗额度）", expanded=False):
+        up = st.file_uploader("选择之前导出的 JSON", type=["json"])
+        if up is not None and st.button("导入这份数据"):
+            try:
+                st.session_state["av_raw"] = json.loads(up.getvalue().decode("utf-8"))
+                st.success(f"已导入 {st.session_state['av_raw'].get('ticker', '?')}。")
+            except Exception as e:
+                st.error(f"导入失败：{e}")
+
     user_key = st.text_input("你的 Alpha Vantage key（仅本次会话使用，不保存）", type="password",
                              help="免费 key：alphavantage.co/support/#api-key，秒拿，25 次/天。")
     try:
@@ -282,6 +292,10 @@ if use_av:
 
     if "av_raw" in st.session_state:
         raw = st.session_state["av_raw"]
+        st.download_button("⬇ 导出此数据（JSON，下次导入免重拉、不耗额度）",
+                           data=json.dumps(raw, ensure_ascii=False),
+                           file_name=f"{raw.get('ticker', 'data')}_av.json",
+                           mime="application/json")
         st.markdown(f"**{raw['ticker']}** 已拉取。下面口径可调，确认后点「填入」推入输入框。")
         add_int = st.checkbox("利息加回（CFO→FCFF 口径）", value=True)
 
@@ -307,6 +321,19 @@ if use_av:
                      hide_index=True, use_container_width=True)
         st.caption("注：AV 现金流表不含 SBC。如需 SBC 负担口径，在下方手动填 SBC 从基年扣除。"
                    "默认基年用 TTM（最近 4 季滚动）——年报可能严重滞后（如美光财年 8 月底结束）。")
+
+        # 可视化：收入与 FCFF 推移（十亿，年报由旧到新，TTM 在最右）
+        crows = list(reversed(rows))
+        clabels = [r["year"] for r in crows] + (["TTM"] if ttm else [])
+        crev = [r["revenue"] / 1e9 for r in crows] + ([ttm["revenue"] / 1e9] if ttm else [])
+        cfcff = [r["fcff"] / 1e9 for r in crows] + ([ttm["fcff"] / 1e9] if ttm else [])
+        vc1, vc2 = st.columns(2)
+        with vc1:
+            st.caption("收入推移（十亿）")
+            st.bar_chart(pd.DataFrame({"收入": crev}, index=clabels))
+        with vc2:
+            st.caption("FCFF 推移（十亿）")
+            st.bar_chart(pd.DataFrame({"FCFF": cfcff}, index=clabels))
 
         # 周期告警：正负年并存直接警告；否则看偏离均值
         fcffs = [r["fcff"] for r in rows]
@@ -462,6 +489,17 @@ if mode == MODE_FCFF:
                 st.warning("终值占比 >75%：结论高度依赖终值假设。")
             if cagr < 0:
                 st.info("解出 CAGR 为负：当前价格隐含 FCFF 长期收缩。")
+            wlo = max(wacc - 0.01, g_term + 1e-4) if terminal == "gordon" else wacc - 0.01
+            srows = []
+            for lbl, c2 in [("基年 FCFF +1%", solve_cagr(ev_target, fcff0 * 1.01, wacc, n, **kw)),
+                            ("基年 FCFF −1%", solve_cagr(ev_target, fcff0 * 0.99, wacc, n, **kw)),
+                            ("WACC +1pp", solve_cagr(ev_target, fcff0, wacc + 0.01, n, **kw)),
+                            ("WACC −1pp", solve_cagr(ev_target, fcff0, wlo, n, **kw))]:
+                srows.append({"单项变动（其他不变）": lbl,
+                              "隐含 CAGR": f"{c2*100:.1f}%" if c2 is not None else "—",
+                              "Δ(pp)": f"{(c2-cagr)*100:+.1f}" if c2 is not None else "—"})
+            st.caption("敏感性（单项变动 ±1%）")
+            st.dataframe(pd.DataFrame(srows), hide_index=True, use_container_width=True)
             if src.strip() == "":
                 st.caption("提示：市值来源/日期未填（铁律 #1）。")
 else:
@@ -503,6 +541,17 @@ else:
                 st.warning("显性期现值为负：整个估值由终值支撑——本质是纯叙事押注。")
             elif ts > 0.75:
                 st.warning("终值占比 >75%：结论高度依赖终值假设。")
+            wlo = max(wacc - 0.01, g_term + 1e-4) if terminal == "gordon" else wacc - 0.01
+            srows = []
+            for lbl, c2 in [("当前收入 +1%", solve_cagr_rev(ev_target, rev0 * 1.01, wacc, n, m0, mT, k, **kw)),
+                            ("当前收入 −1%", solve_cagr_rev(ev_target, rev0 * 0.99, wacc, n, m0, mT, k, **kw)),
+                            ("WACC +1pp", solve_cagr_rev(ev_target, rev0, wacc + 0.01, n, m0, mT, k, **kw)),
+                            ("WACC −1pp", solve_cagr_rev(ev_target, rev0, wlo, n, m0, mT, k, **kw))]:
+                srows.append({"单项变动（其他不变）": lbl,
+                              "隐含收入 CAGR": f"{c2*100:.1f}%" if c2 is not None else "—",
+                              "Δ(pp)": f"{(c2-cagr)*100:+.1f}" if c2 is not None else "—"})
+            st.caption("敏感性（单项变动 ±1%；稳态利润率 mT 的敏感性见上方提示）")
+            st.dataframe(pd.DataFrame(srows), hide_index=True, use_container_width=True)
             if src.strip() == "":
                 st.caption("提示：市值来源/日期未填（铁律 #1）。")
 
