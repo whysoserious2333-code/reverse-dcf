@@ -219,7 +219,7 @@ REGION_PRESETS = {"美国 (US)": (4.5, 5.5), "日本 (JP)": (1.6, 6.0),
 MODE_FCFF = "从 FCFF 出发（已盈利 / 正现金流）"
 MODE_REV = "从收入出发（当前 FCFF 为负 / 盈利前）"
 DEFAULTS = {"in_ccy": "USD", "in_mktcap": 1000.0, "in_netdebt": 0.0,
-            "in_fcff0": 60.0, "in_rev0": 10.0, "in_curfcff": -3.0}
+            "in_fcff0": 60.0, "in_rev0": 10.0, "in_curfcff": -3.0, "in_wd": 5.0}
 
 # ============================================================
 # 3. 页面
@@ -294,6 +294,10 @@ if use_av:
                    + ("　⚠ 市值/财报币种不一致" if mc_cur != nd_cur else ""))
         st.caption(f"净负债构成：有息负债 {nd_debt:,.0f} − 现金及短投 {nd_cash:,.0f} = "
                    f"{nd:,.0f}（财报 as-of {nd_date} {nd_cur}）")
+        wd_est = (nd_debt / (nd_debt + mc) * 100) if (nd_debt + mc) > 0 else None
+        if wd_est is not None:
+            st.caption(f"由此估算 WACC 债务权重 D/(D+E) ≈ {wd_est:.1f}%"
+                       f"（股权按市值、债务按账面；填入时写进 WACC，仍可改）")
 
         disp = ([ttm] + rows) if ttm else rows
         df = pd.DataFrame(disp)[["year", "revenue", "cfo", "capex", "intx", "eff_tax", "fcff"]]
@@ -328,6 +332,8 @@ if use_av:
             st.session_state["in_mktcap"] = float(mc)
             st.session_state["in_netdebt"] = float(nd)
             st.session_state["in_ccy"] = mc_cur
+            if wd_est is not None:
+                st.session_state["in_wd"] = float(max(0.0, min(100.0, wd_est)))
             if mode == MODE_FCFF:
                 st.session_state["in_fcff0"] = float(base_fcff - sbc_manual)
             else:
@@ -386,7 +392,7 @@ with st.expander("WACC（默认美国口径，可改）", expanded=False):
         c4, c5, c6 = st.columns(3)
         kd = c4.number_input("税前 Kd (%)", value=5.0, step=0.1, format="%.2f")
         tax = c5.number_input("税率 (%)", value=21.0, step=0.5, format="%.2f")
-        wd = c6.number_input("债务权重 (%)", value=5.0, step=1.0, format="%.1f")
+        wd = c6.number_input("债务权重 D/(D+E) (%)", key="in_wd", step=1.0, format="%.1f")
         wacc, ke = capm_wacc(rf/100, erp/100, beta, kd/100, tax/100, wd/100)
     w1, w2 = st.columns(2)
     w1.metric("WACC", f"{wacc*100:.2f}%")
