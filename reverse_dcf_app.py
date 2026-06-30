@@ -17,12 +17,23 @@ import json
 import time
 import pandas as pd
 import streamlit as st
+import altair as alt
 from scipy.optimize import brentq
 
 try:
     import requests
 except ImportError:
     requests = None
+
+
+def ordered_bar(labels, values, value_name):
+    """柱状图，X 轴按给定 labels 顺序排列（不被自动字母序打乱），支持负值。"""
+    df = pd.DataFrame({"x": labels, value_name: values})
+    return alt.Chart(df).mark_bar().encode(
+        x=alt.X("x:N", sort=list(labels), title=None),
+        y=alt.Y(f"{value_name}:Q", title=None),
+        tooltip=["x", value_name],
+    )
 
 # ============================================================
 # 1. 反推引擎
@@ -330,10 +341,10 @@ if use_av:
         vc1, vc2 = st.columns(2)
         with vc1:
             st.caption("收入推移（十亿）")
-            st.bar_chart(pd.DataFrame({"收入": crev}, index=clabels))
+            st.altair_chart(ordered_bar(clabels, crev, "收入"), use_container_width=True)
         with vc2:
             st.caption("FCFF 推移（十亿）")
-            st.bar_chart(pd.DataFrame({"FCFF": cfcff}, index=clabels))
+            st.altair_chart(ordered_bar(clabels, cfcff, "FCFF"), use_container_width=True)
 
         # 周期告警：正负年并存直接警告；否则看偏离均值
         fcffs = [r["fcff"] for r in rows]
@@ -485,7 +496,7 @@ if mode == MODE_FCFF:
             proj_fcff = [fcff0 * (1 + cagr) ** t for t in range(1, n + 1)]
             proj_fcff.append(fcff0 * (1 + cagr) ** n * (1 + g_term))
             st.caption("市场隐含的预测期 FCFF 轨迹（最后一根为终值首期 N+1，单位同输入）")
-            st.bar_chart(pd.DataFrame({"FCFF": proj_fcff}, index=proj_labels))
+            st.altair_chart(ordered_bar(proj_labels, proj_fcff, "FCFF"), use_container_width=True)
             d1, d2, d3 = st.columns(3)
             d1.metric("终值现值占比", f"{ts*100:.0f}%")
             d2.metric(f"FCFF_{n}", f"{fcff_n:,.1f}")
@@ -544,10 +555,10 @@ else:
             pc1, pc2 = st.columns(2)
             with pc1:
                 st.caption("隐含预测期收入（含终值首期 N+1）")
-                st.bar_chart(pd.DataFrame({"收入": proj_rev}, index=proj_labels))
+                st.altair_chart(ordered_bar(proj_labels, proj_rev, "收入"), use_container_width=True)
             with pc2:
                 st.caption("隐含预测期 FCFF（含终值首期 N+1）")
-                st.bar_chart(pd.DataFrame({"FCFF": proj_fcff}, index=proj_labels))
+                st.altair_chart(ordered_bar(proj_labels, proj_fcff, "FCFF"), use_container_width=True)
             d1, d2, d3 = st.columns(3)
             d1.metric("终值现值占比", f"{ts*100:.0f}%" if ts != float("inf") else "n/a")
             d2.metric(f"FCFF_{n}", f"{fcff_n:,.1f}")
