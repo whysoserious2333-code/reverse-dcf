@@ -308,6 +308,19 @@ if use_av:
                            file_name=f"{raw.get('ticker', 'data')}_av.json",
                            mime="application/json")
         st.markdown(f"**{raw['ticker']}** 已拉取。下面口径可调，确认后点「填入」推入输入框。")
+        ov = raw.get("ov", {})
+        cname = ov.get("Name")
+        meta = " · ".join([b for b in [ov.get("Exchange"), ov.get("Sector"), ov.get("Industry")]
+                           if b and str(b).lower() != "none"])
+        if cname and str(cname).lower() != "none":
+            st.caption(f"**{cname}**" + (f"｜{meta}" if meta else ""))
+        desc = (ov.get("Description") or "").strip()
+        if desc and desc.lower() != "none":
+            short = desc if len(desc) <= 200 else desc[:200].rsplit(" ", 1)[0] + "…"
+            st.caption(short)
+            if len(desc) > len(short):
+                with st.expander("完整公司简介（AV，英文）"):
+                    st.write(desc)
         add_int = st.checkbox("利息加回（CFO→FCFF 口径）", value=True)
 
         rows = compute_fcff_series_av(raw["cf_a"], raw["is_a"], add_int)
