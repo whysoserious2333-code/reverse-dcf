@@ -183,7 +183,8 @@ def compute_fcff_series_av(cf_annual, is_annual, add_back_interest=True):
         if add_back_interest:
             fcff += intx * (1 - eff_tax)
         rows.append(dict(year=(c.get("fiscalDateEnding", "") or "")[:4], revenue=rev,
-                         cfo=cfo, capex=capex, intx=intx, eff_tax=eff_tax, fcff=fcff))
+                         cfo=cfo, capex=capex, intx=intx, eff_tax=eff_tax, fcff=fcff,
+                         margin=(fcff / rev if rev else float("nan"))))
     return rows
 
 
@@ -203,7 +204,8 @@ def compute_ttm_av(cf_q, is_q, add_back_interest=True):
     if add_back_interest:
         fcff += intx * (1 - eff_tax)
     return dict(year=f"TTM(截至{cfq[0].get('fiscalDateEnding')})", revenue=rev,
-                cfo=cfo, capex=capex, intx=intx, eff_tax=eff_tax, fcff=fcff)
+                cfo=cfo, capex=capex, intx=intx, eff_tax=eff_tax, fcff=fcff,
+                margin=(fcff / rev if rev else float("nan")))
 
 
 def net_debt_av(bs_annual):
@@ -338,13 +340,15 @@ if use_av:
                        f"（股权按市值、债务按账面；填入时写进 WACC，仍可改）")
 
         disp = ([ttm] + rows) if ttm else rows
-        df = pd.DataFrame(disp)[["year", "revenue", "cfo", "capex", "intx", "eff_tax", "fcff"]]
-        df.columns = ["年", "收入", "CFO", "Capex", "利息", "有效税率", "FCFF"]
+        df = pd.DataFrame(disp)[["year", "revenue", "cfo", "capex", "intx", "eff_tax", "fcff", "margin"]]
+        df.columns = ["年", "收入", "CFO", "Capex", "利息", "有效税率", "FCFF", "FCFF利润率"]
         st.dataframe(df.style.format({"收入": "{:,.0f}", "CFO": "{:,.0f}", "Capex": "{:,.0f}",
-                                      "利息": "{:,.0f}", "有效税率": "{:.1%}", "FCFF": "{:,.0f}"}),
+                                      "利息": "{:,.0f}", "有效税率": "{:.1%}", "FCFF": "{:,.0f}",
+                                      "FCFF利润率": lambda v: f"{v:.1%}" if pd.notna(v) else "—"}),
                      hide_index=True, use_container_width=True)
         st.caption("注：AV 现金流表不含 SBC。如需 SBC 负担口径，在下方手动填 SBC 从基年扣除。"
-                   "默认基年用 TTM（最近 4 季滚动）——年报可能严重滞后（如美光财年 8 月底结束）。")
+                   "默认基年用 TTM（最近 4 季滚动）——年报可能严重滞后（如美光财年 8 月底结束）。"
+                   "「FCFF利润率」= FCFF/收入，与收入模式的稳态利润率 mT 同口径，可作设定 mT 的历史参考。")
 
         # 可视化：收入与 FCFF 推移（十亿，年报由旧到新，TTM 在最右）
         crows = list(reversed(rows))
