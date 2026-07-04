@@ -35,6 +35,28 @@ def ordered_bar(labels, values, value_name):
         tooltip=["x", value_name],
     )
 
+
+def fmt_amt(x):
+    """大数可读化：万亿 / 十亿 / 百万，小数原样。"""
+    ax = abs(x)
+    if ax >= 1e12:
+        return f"{x/1e12:,.2f} 万亿"
+    if ax >= 1e9:
+        return f"{x/1e9:,.2f} 十亿"
+    if ax >= 1e6:
+        return f"{x/1e6:,.1f} 百万"
+    return f"{x:,.1f}"
+
+
+def scale_series(vals):
+    """按量级把序列缩到可读单位，返回 (缩放后序列, 单位标签)。"""
+    m = max((abs(v) for v in vals), default=0)
+    if m >= 1e9:
+        return [v / 1e9 for v in vals], "（十亿）"
+    if m >= 1e6:
+        return [v / 1e6 for v in vals], "（百万）"
+    return list(vals), ""
+
 # ============================================================
 # 1. 反推引擎
 # ============================================================
@@ -244,11 +266,9 @@ for k, v in DEFAULTS.items():
 
 st.title("反推 DCF · 预期翻译器")
 st.info(
-    "**这个工具只做一件事**：把市场报价（市值）反推成它隐含的增长预期。\n\n"
-    "它**不是估值、不是目标价、不是买卖建议**。它只告诉你——以今天的价格买入，"
-    "市场默认了什么样的增长。\n\n"
-    "下面所有默认值（含自动拉取的财报）都只是**一个起点**。结论完全取决于你喂进去的输入，"
-    "请务必按最新财报和你自己的判断逐项调整。"
+    "**把市场报价（市值）反推成它隐含的增长预期**——不是估值、不是目标价、不是买卖建议，"
+    "它只回答：以今天的价格买入，市场默认了什么样的增长。\n\n"
+    "所有默认值（含自动拉取的财报）只是起点，结论完全取决于你喂进去的输入，请逐项核对调整。"
 )
 with st.expander("⚠ 先读：方法适用边界", expanded=False):
     st.warning(
@@ -318,26 +338,24 @@ if use_av:
             st.caption(f"**{cname}**" + (f"｜{meta}" if meta else ""))
         desc = (ov.get("Description") or "").strip()
         if desc and desc.lower() != "none":
-            short = desc if len(desc) <= 200 else desc[:200].rsplit(" ", 1)[0] + "…"
-            st.caption(short)
-            if len(desc) > len(short):
-                with st.expander("完整公司简介（AV，英文）"):
-                    st.write(desc)
+            with st.expander("公司简介（AV，英文）"):
+                st.write(desc)
         add_int = st.checkbox("利息加回（CFO→FCFF 口径）", value=True)
 
         rows = compute_fcff_series_av(raw["cf_a"], raw["is_a"], add_int)
         ttm = compute_ttm_av(raw["cf_q"], raw["is_q"], add_int)
         nd, nd_debt, nd_cash, nd_date, nd_cur = net_debt_av(raw["bs_a"])
         mc, mc_cur, name, mc_when = market_cap_av(raw["ov"], raw.get("quote"))
-
-        st.caption(f"市值 {mc:,.0f} {mc_cur} · {mc_when} — 发布前请用你的源核对（铁律 #1）"
-                   + ("　⚠ 市值/财报币种不一致" if mc_cur != nd_cur else ""))
-        st.caption(f"净负债构成：有息负债 {nd_debt:,.0f} − 现金及短投 {nd_cash:,.0f} = "
-                   f"{nd:,.0f}（财报 as-of {nd_date} {nd_cur}）")
         wd_est = (nd_debt / (nd_debt + mc) * 100) if (nd_debt + mc) > 0 else None
-        if wd_est is not None:
-            st.caption(f"由此估算 WACC 债务权重 D/(D+E) ≈ {wd_est:.1f}%"
-                       f"（股权按市值、债务按账面；填入时写进 WACC，仍可改）")
+
+        pm1, pm2, pm3 = st.columns(3)
+        pm1.metric(f"市值（{mc_cur}）", fmt_amt(mc))
+        pm2.metric("净负债", fmt_amt(nd))
+        pm3.metric("估算债务权重", f"{wd_est:.1f}%" if wd_est is not None else "—")
+        st.caption(f"市值 {mc:,.0f} · {mc_when}，发布前请用你的源核对（铁律 #1）"
+                   + ("　⚠ 市值/财报币种不一致" if mc_cur != nd_cur else "")
+                   + f"｜净负债 = 有息负债 {nd_debt:,.0f} − 现金及短投 {nd_cash:,.0f}"
+                   f"（as-of {nd_date} {nd_cur}）｜债务权重按股权市值、债务账面，填入时写进 WACC，仍可改")
 
         disp = ([ttm] + rows) if ttm else rows
         df = pd.DataFrame(disp)[["year", "revenue", "cfo", "capex", "intx", "eff_tax", "fcff", "margin"]]
@@ -350,18 +368,19 @@ if use_av:
                    "默认基年用 TTM（最近 4 季滚动）——年报可能严重滞后（如美光财年 8 月底结束）。"
                    "「FCFF利润率」= FCFF/收入，与收入模式的稳态利润率 mT 同口径，可作设定 mT 的历史参考。")
 
-        # 可视化：收入与 FCFF 推移（十亿，年报由旧到新，TTM 在最右）
+        # 可视化：收入与 FCFF 推移（十亿，年报由旧到新，TTM 在最右）——参考信息，默认收起
         crows = list(reversed(rows))
         clabels = [r["year"] for r in crows] + (["TTM"] if ttm else [])
         crev = [r["revenue"] / 1e9 for r in crows] + ([ttm["revenue"] / 1e9] if ttm else [])
         cfcff = [r["fcff"] / 1e9 for r in crows] + ([ttm["fcff"] / 1e9] if ttm else [])
-        vc1, vc2 = st.columns(2)
-        with vc1:
-            st.caption("收入推移（十亿）")
-            st.altair_chart(ordered_bar(clabels, crev, "收入"), use_container_width=True)
-        with vc2:
-            st.caption("FCFF 推移（十亿）")
-            st.altair_chart(ordered_bar(clabels, cfcff, "FCFF"), use_container_width=True)
+        with st.expander("历史收入 / FCFF 推移图（十亿）", expanded=False):
+            vc1, vc2 = st.columns(2)
+            with vc1:
+                st.caption("收入推移（十亿）")
+                st.altair_chart(ordered_bar(clabels, crev, "收入"), use_container_width=True)
+            with vc2:
+                st.caption("FCFF 推移（十亿）")
+                st.altair_chart(ordered_bar(clabels, cfcff, "FCFF"), use_container_width=True)
 
         # 周期告警：正负年并存直接警告；否则看偏离均值
         fcffs = [r["fcff"] for r in rows]
@@ -406,7 +425,7 @@ with col_l:
     st.number_input(f"市值 ({ccy})", key="in_mktcap", step=10.0, format="%.1f")
     st.number_input(f"净负债 = 有息负债 − 现金 ({ccy})", key="in_netdebt", step=10.0, format="%.1f")
     ev_target = st.session_state["in_mktcap"] + st.session_state["in_netdebt"]
-    st.metric("→ 隐含 EV", f"{ev_target:,.1f}")
+    st.metric("→ 隐含 EV", fmt_amt(ev_target))
     src = st.text_input("市值来源 + 日期（铁律 #1）", placeholder="例: 2026-06-27 收盘 · TradingView")
 
 with col_r:
@@ -506,17 +525,19 @@ if mode == MODE_FCFF:
         else:
             _, pve, pvt, fcff_n, _ = dcf_ev(fcff0, cagr, wacc, n, **kw)
             ts = pvt / (pve + pvt)
+            st.subheader("反推结果")
             st.metric(f"隐含 {n} 年 FCFF CAGR", f"{cagr*100:.1f}%")
             st.markdown(f"> 市场报价隐含：未来 **{n} 年 FCFF 年均增长 {cagr*100:.1f}%**，"
                         f"即 {n} 年后达到今天的 **{(1+cagr)**n:.1f} 倍**。")
             proj_labels = [f"Y{t}" for t in range(1, n + 1)] + ["N+1·终值首期"]
             proj_fcff = [fcff0 * (1 + cagr) ** t for t in range(1, n + 1)]
             proj_fcff.append(fcff0 * (1 + cagr) ** n * (1 + g_term))
-            st.caption("市场隐含的预测期 FCFF 轨迹（最后一根为终值首期 N+1，单位同输入）")
-            st.altair_chart(ordered_bar(proj_labels, proj_fcff, "FCFF"), use_container_width=True)
+            pf_scaled, pf_unit = scale_series(proj_fcff)
+            st.caption(f"市场隐含的预测期 FCFF 轨迹{pf_unit}（最后一根为终值首期 N+1）")
+            st.altair_chart(ordered_bar(proj_labels, pf_scaled, "FCFF"), use_container_width=True)
             d1, d2, d3 = st.columns(3)
             d1.metric("终值现值占比", f"{ts*100:.0f}%")
-            d2.metric(f"FCFF_{n}", f"{fcff_n:,.1f}")
+            d2.metric(f"FCFF_{n}", fmt_amt(fcff_n))
             d3.metric("WACC", f"{wacc*100:.2f}%")
             if ts > 0.75:
                 st.warning("终值占比 >75%：结论高度依赖终值假设。")
@@ -556,6 +577,7 @@ else:
             _, pve, pvt, fcff_n, rev_n, fcffs = dcf_ev_rev(rev0, cagr, wacc, n, m0, mT, k, **kw)
             ts = pvt / (pve + pvt) if (pve + pvt) != 0 else float("inf")
             cy = crossover_year(m0, mT, k)
+            st.subheader("反推结果")
             st.metric(f"隐含 {n} 年【收入】CAGR", f"{cagr*100:.1f}%")
             lo = solve_cagr_rev(ev_target, rev0, wacc, n, m0, mT+0.05, k, **kw)
             hi = solve_cagr_rev(ev_target, rev0, wacc, n, m0, mT-0.05, k, **kw)
@@ -564,21 +586,23 @@ else:
             st.warning(f"⚠ **收入端反推**：头条是【收入】CAGR，不是 FCFF CAGR。"
                        f"结论高度依赖你假设的稳态利润率 mT = {mT*100:.0f}%（最任性的输入）。{sens}")
             st.markdown(f"> 未来 **{n} 年收入年均增长 {cagr*100:.1f}%**（{n} 年后收入 = 今天的 "
-                        f"**{(1+cagr)**n:.1f} 倍**）。利润率在 {k} 年内从 {m0*100:.1f}% 收敛到 {mT*100:.0f}%。")
-            st.info(f"按此路径，FCFF 预计第 **{cy:.1f}** 年转正（之前各年为负，已计入折现）。")
+                        f"**{(1+cagr)**n:.1f} 倍**）。利润率在 {k} 年内从 {m0*100:.1f}% 收敛到 {mT*100:.0f}%，"
+                        f"FCFF 预计第 **{cy:.1f}** 年转正（之前各年为负，已计入折现）。")
             proj_labels = [f"Y{t}" for t in range(1, n + 1)] + ["N+1·终值首期"]
             proj_rev = [rev0 * (1 + cagr) ** t for t in range(1, n + 1)] + [rev_n * (1 + g_term)]
             proj_fcff = list(fcffs) + [fcff_n * (1 + g_term)]
+            pr_scaled, pr_unit = scale_series(proj_rev)
+            pf_scaled, pf_unit = scale_series(proj_fcff)
             pc1, pc2 = st.columns(2)
             with pc1:
-                st.caption("隐含预测期收入（含终值首期 N+1）")
-                st.altair_chart(ordered_bar(proj_labels, proj_rev, "收入"), use_container_width=True)
+                st.caption(f"隐含预测期收入{pr_unit}（含终值首期 N+1）")
+                st.altair_chart(ordered_bar(proj_labels, pr_scaled, "收入"), use_container_width=True)
             with pc2:
-                st.caption("隐含预测期 FCFF（含终值首期 N+1）")
-                st.altair_chart(ordered_bar(proj_labels, proj_fcff, "FCFF"), use_container_width=True)
+                st.caption(f"隐含预测期 FCFF{pf_unit}（含终值首期 N+1）")
+                st.altair_chart(ordered_bar(proj_labels, pf_scaled, "FCFF"), use_container_width=True)
             d1, d2, d3 = st.columns(3)
             d1.metric("终值现值占比", f"{ts*100:.0f}%" if ts != float("inf") else "n/a")
-            d2.metric(f"FCFF_{n}", f"{fcff_n:,.1f}")
+            d2.metric(f"FCFF_{n}", fmt_amt(fcff_n))
             d3.metric("m₀ → mT", f"{m0*100:.0f}% → {mT*100:.0f}%")
             if pve < 0:
                 st.warning("显性期现值为负：整个估值由终值支撑——本质是纯叙事押注。")
@@ -590,19 +614,22 @@ else:
                             ("当前收入 −1%", solve_cagr_rev(ev_target, rev0 * 0.99, wacc, n, m0, mT, k, **kw)),
                             ("WACC +1pp", solve_cagr_rev(ev_target, rev0, wacc + 0.01, n, m0, mT, k, **kw)),
                             ("WACC −1pp", solve_cagr_rev(ev_target, rev0, wlo, n, m0, mT, k, **kw))]:
-                srows.append({"单项变动（其他不变）": lbl,
+                srows.append({"单项变动": lbl,
                               "隐含收入 CAGR": f"{c2*100:.1f}%" if c2 is not None else "—",
                               "Δ(pp)": f"{(c2-cagr)*100:+.1f}" if c2 is not None else "—"})
-            st.caption("敏感性（单项变动 ±1%；稳态利润率 mT 的敏感性见下表）")
-            st.dataframe(pd.DataFrame(srows), hide_index=True, use_container_width=True)
             mt_rows = []
             for mt in [0.05, 0.10, 0.15, 0.20, 0.25, 0.30]:
                 c2 = solve_cagr_rev(ev_target, rev0, wacc, n, m0, mt, k, **kw)
                 mt_rows.append({"稳态利润率 mT": f"{mt*100:.0f}%",
                                 "隐含收入 CAGR": f"{c2*100:.1f}%" if c2 is not None else "—",
-                                "Δ(pp) vs 当前": f"{(c2-cagr)*100:+.1f}" if c2 is not None else "—"})
-            st.caption(f"稳态利润率 mT 完整敏感性（最关键假设；当前 mT = {mT*100:.0f}%）")
-            st.dataframe(pd.DataFrame(mt_rows), hide_index=True, use_container_width=True)
+                                "Δ(pp)": f"{(c2-cagr)*100:+.1f}" if c2 is not None else "—"})
+            sc1, sc2 = st.columns(2)
+            with sc1:
+                st.caption("敏感性（单项 ±1%，其他不变）")
+                st.dataframe(pd.DataFrame(srows), hide_index=True, use_container_width=True)
+            with sc2:
+                st.caption(f"稳态利润率 mT 敏感性（最关键假设；当前 {mT*100:.0f}%）")
+                st.dataframe(pd.DataFrame(mt_rows), hide_index=True, use_container_width=True)
             if src.strip() == "":
                 st.caption("提示：市值来源/日期未填（铁律 #1）。")
 
